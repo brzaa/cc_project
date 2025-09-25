@@ -265,9 +265,7 @@ Tools: BigQuery SQL → Looker Studio Dashboard → Business Insights
 
 For questions about this analysis, technical implementation, or potential collaboration opportunities:
 
-- **Email:** [Your Email]
-- **LinkedIn:** [Your LinkedIn Profile]
-- **Portfolio:** [Your Portfolio Website]
+- **LinkedIn:** https://www.linkedin.com/in/bramastya/
 
 ---
 
