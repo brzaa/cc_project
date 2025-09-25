@@ -1,389 +1,322 @@
-WITH cleaned_transactions AS (
-    SELECT 
-        client_id,
-        card_id,
-        COALESCE(SAFE_CAST(yearly_income AS FLOAT64) * 15000, 0) as annual_income_idr,
-        COALESCE(SAFE_CAST(credit_score AS INT64), 0) as credit_score,
-        COALESCE(SAFE_CAST(credit_limit AS FLOAT64) * 15000, 0) as credit_limit_idr,
-        COALESCE(SAFE_CAST(absolute_amount AS FLOAT64) * 15000, 0) as transaction_amount_idr,
-        COALESCE(TRIM(UPPER(payment_type)), 'UNKNOWN') as payment_type,
-        COALESCE(TRIM(UPPER(use_chip)), 'UNKNOWN') as chip_usage,
-        COALESCE(TRIM(UPPER(errors_imputed)), 'ERRORLESS') as error_status,
-        COALESCE(mcc, 0) as merchant_category_code,
-        COALESCE(TRIM(merchant_city), 'UNKNOWN') as merchant_city,
-        COALESCE(TRIM(merchant_state_imputed), 'UNKNOWN') as merchant_state,
-        COALESCE(merchant_id, 0) as merchant_id,
-        COALESCE(TRIM(card_brand), 'UNKNOWN') as card_brand,
-        transaction_ts,
-        SAFE_CAST(transaction_ts AS DATE) as transaction_date,
-        EXTRACT(HOUR FROM transaction_ts) as transaction_hour,
-        EXTRACT(DAYOFWEEK FROM transaction_ts) as day_of_week,
-        EXTRACT(MONTH FROM transaction_ts) as transaction_month,
-        EXTRACT(YEAR FROM transaction_ts) as transaction_year,
-        transaction_day,
-        zip_imputed as zip_code
-    FROM `mlops-thesis.mandiri.raw_data`
-    WHERE 
-        client_id IS NOT NULL
-        AND transaction_ts IS NOT NULL
-        AND SAFE_CAST(absolute_amount AS FLOAT64) > 0
-),
-
-customer_demographics AS (
-    SELECT 
-        client_id,
-        MAX(annual_income_idr) as annual_income_idr,
-        MAX(credit_score) as credit_score, 
-        MAX(credit_limit_idr) as credit_limit_idr,
-        COALESCE(APPROX_TOP_COUNT(card_brand, 1)[SAFE_OFFSET(0)].value, 'UNKNOWN') as primary_card_brand,
-        CASE 
-            WHEN MAX(annual_income_idr) < 100000000 THEN 'LOW_INCOME'
-            WHEN MAX(annual_income_idr) < 300000000 THEN 'MIDDLE_INCOME' 
-            WHEN MAX(annual_income_idr) < 500000000 THEN 'UPPER_MIDDLE'
-            ELSE 'HIGH_INCOME'
-        END as income_segment,
-        CASE 
-            WHEN MAX(credit_score) >= 750 THEN 'EXCELLENT'
-            WHEN MAX(credit_score) >= 700 THEN 'GOOD'
-            WHEN MAX(credit_score) >= 650 THEN 'FAIR'
-            ELSE 'POOR'
-        END as credit_tier,
-        CASE 
-            WHEN MAX(credit_limit_idr) >= 750000000 THEN 'PREMIUM'
-            WHEN MAX(credit_limit_idr) >= 300000000 THEN 'HIGH_LIMIT'
-            WHEN MAX(credit_limit_idr) >= 150000000 THEN 'STANDARD'
-            ELSE 'BASIC'
-        END as credit_limit_tier
-    FROM cleaned_transactions
-    GROUP BY client_id
-),
-
-transaction_behaviors AS (
-    SELECT 
-        client_id,
-        COUNT(*) as total_transactions,
-        SUM(transaction_amount_idr) as total_spending_idr,
-        ROUND(AVG(transaction_amount_idr), 2) as avg_transaction_amount_idr,
-        ROUND(STDDEV(transaction_amount_idr), 2) as spending_volatility_idr,
-        
-        SUM(CASE WHEN payment_type = 'CREDIT' THEN 1 ELSE 0 END) as credit_transactions,
-        SUM(CASE WHEN payment_type = 'DEBIT' THEN 1 ELSE 0 END) as debit_transactions,
-        
-        SUM(CASE WHEN chip_usage LIKE '%CHIP%' THEN 1 ELSE 0 END) as chip_transactions,
-        SUM(CASE WHEN chip_usage LIKE '%SWIPE%' THEN 1 ELSE 0 END) as swipe_transactions,
-        
-        SUM(CASE WHEN transaction_hour BETWEEN 22 AND 23 OR transaction_hour BETWEEN 0 AND 6 
-                 THEN 1 ELSE 0 END) as night_transactions,
-        SUM(CASE WHEN day_of_week IN (1, 7) THEN 1 ELSE 0 END) as weekend_transactions,
-        SUM(CASE WHEN transaction_hour BETWEEN 9 AND 17 THEN 1 ELSE 0 END) as business_hours_transactions,
-        
-        SUM(CASE WHEN error_status != 'ERRORLESS' THEN 1 ELSE 0 END) as error_transactions,
-        SUM(CASE WHEN error_status LIKE '%PIN%' THEN 1 ELSE 0 END) as pin_error_transactions,
-        SUM(CASE WHEN error_status LIKE '%INSUFFICIENT%' THEN 1 ELSE 0 END) as insufficient_balance_errors,
-        SUM(CASE WHEN error_status LIKE '%TECHNICAL%' THEN 1 ELSE 0 END) as technical_errors,
-        
-        COUNT(DISTINCT merchant_city) as unique_cities_visited,
-        COUNT(DISTINCT merchant_state) as unique_states_visited,
-        COUNT(DISTINCT merchant_id) as unique_merchants_used,
-        COUNT(DISTINCT merchant_category_code) as unique_merchant_categories,
-        COUNT(DISTINCT card_id) as cards_used,
-        
-        MIN(transaction_amount_idr) as min_transaction_idr,
-        MAX(transaction_amount_idr) as max_transaction_idr,
-        APPROX_QUANTILES(transaction_amount_idr, 100)[OFFSET(50)] as median_transaction_idr,
-        APPROX_QUANTILES(transaction_amount_idr, 100)[OFFSET(75)] as p75_transaction_idr,
-        APPROX_QUANTILES(transaction_amount_idr, 100)[OFFSET(95)] as p95_transaction_idr
-    FROM cleaned_transactions
-    GROUP BY client_id
-),
-
-merchant_category_analysis AS (
-    SELECT 
-        client_id,
-        SUM(CASE WHEN merchant_category_code = 5411 THEN transaction_amount_idr ELSE 0 END) as grocery_spending_idr,
-        SUM(CASE WHEN merchant_category_code IN (5812, 5813, 5814) THEN transaction_amount_idr ELSE 0 END) as restaurant_spending_idr,
-        SUM(CASE WHEN merchant_category_code = 5541 THEN transaction_amount_idr ELSE 0 END) as gas_spending_idr,
-        SUM(CASE WHEN merchant_category_code = 4121 THEN transaction_amount_idr ELSE 0 END) as transportation_spending_idr,
-        SUM(CASE WHEN merchant_category_code = 7011 THEN transaction_amount_idr ELSE 0 END) as hotel_spending_idr,
-        SUM(CASE WHEN merchant_category_code BETWEEN 4000 AND 4999 THEN transaction_amount_idr ELSE 0 END) as travel_spending_idr,
-        SUM(CASE WHEN merchant_category_code BETWEEN 5000 AND 5099 THEN transaction_amount_idr ELSE 0 END) as automotive_spending_idr,
-        SUM(CASE WHEN merchant_category_code BETWEEN 5200 AND 5299 THEN transaction_amount_idr ELSE 0 END) as home_garden_spending_idr,
-        SUM(CASE WHEN merchant_category_code BETWEEN 5300 AND 5399 THEN transaction_amount_idr ELSE 0 END) as clothing_spending_idr,
-        SUM(CASE WHEN merchant_category_code BETWEEN 5900 AND 5999 THEN transaction_amount_idr ELSE 0 END) as general_merchandise_spending_idr,
-        
-        SUM(CASE WHEN merchant_category_code = 5411 THEN 1 ELSE 0 END) as grocery_transactions,
-        SUM(CASE WHEN merchant_category_code IN (5812, 5813, 5814) THEN 1 ELSE 0 END) as restaurant_transactions,
-        SUM(CASE WHEN merchant_category_code = 5541 THEN 1 ELSE 0 END) as gas_transactions,
-        
-        COALESCE(APPROX_TOP_COUNT(merchant_category_code, 1)[SAFE_OFFSET(0)].value, 0) as most_frequent_mcc,
-        COUNT(DISTINCT merchant_category_code) as category_diversity
-    FROM cleaned_transactions
-    WHERE merchant_category_code > 0
-    GROUP BY client_id
-),
-
-temporal_patterns AS (
-    SELECT 
-        client_id,
-        COUNT(DISTINCT transaction_date) as active_days,
-        COUNT(DISTINCT DATE_TRUNC(transaction_date, WEEK)) as active_weeks,
-        COUNT(DISTINCT DATE_TRUNC(transaction_date, MONTH)) as active_months,
-        COUNT(DISTINCT transaction_year) as active_years,
-        
-        MIN(transaction_date) as first_transaction_date,
-        MAX(transaction_date) as last_transaction_date,
-        GREATEST(DATE_DIFF(MAX(transaction_date), MIN(transaction_date), DAY) + 1, 1) as customer_tenure_days,
-        
-        COALESCE(APPROX_TOP_COUNT(transaction_month, 1)[SAFE_OFFSET(0)].value, 0) as peak_spending_month,
-        COALESCE(APPROX_TOP_COUNT(day_of_week, 1)[SAFE_OFFSET(0)].value, 0) as preferred_transaction_day,
-        COALESCE(APPROX_TOP_COUNT(transaction_hour, 1)[SAFE_OFFSET(0)].value, 0) as preferred_transaction_hour,
-        
-        AVG(CASE WHEN day_of_week BETWEEN 2 AND 6 THEN transaction_amount_idr END) as avg_weekday_spending,
-        AVG(CASE WHEN day_of_week IN (1, 7) THEN transaction_amount_idr END) as avg_weekend_spending
-    FROM cleaned_transactions
-    GROUP BY client_id
-),
-
-risk_assessment AS (
-    SELECT 
-        client_id,
-        
-        CASE 
-            WHEN total_transactions > 0 THEN 
-                ROUND(CAST(error_transactions AS FLOAT64) / total_transactions * 100, 2)
-            ELSE 0 
-        END as error_rate_percent,
-        
-        pin_error_transactions,
-        insufficient_balance_errors,
-        technical_errors,
-        
-        CASE 
-            WHEN max_transaction_idr > 0 AND avg_transaction_amount_idr > 0 THEN
-                ROUND(max_transaction_idr / avg_transaction_amount_idr, 2)
-            ELSE 0
-        END as transaction_size_volatility_ratio,
-        
-        CASE 
-            WHEN spending_volatility_idr IS NOT NULL AND avg_transaction_amount_idr > 0 THEN
-                ROUND(spending_volatility_idr / avg_transaction_amount_idr, 2)
-            ELSE 0
-        END as spending_consistency_score,
-        
-        unique_cities_visited,
-        unique_states_visited,
-        unique_merchants_used,
-        cards_used,
-        
-        CASE 
-            WHEN total_transactions > 0 THEN 
-                ROUND(CAST(night_transactions AS FLOAT64) / total_transactions * 100, 2)
-            ELSE 0 
-        END as night_activity_percent,
-        
-        CASE 
-            WHEN CAST(error_transactions AS FLOAT64) / NULLIF(total_transactions, 0) > 0.15 THEN 'HIGH_RISK'
-            WHEN pin_error_transactions >= 5 THEN 'SECURITY_RISK'
-            WHEN max_transaction_idr / NULLIF(avg_transaction_amount_idr, 0) > 50 THEN 'UNUSUAL_PATTERN'
-            WHEN unique_cities_visited > 20 THEN 'HIGH_MOBILITY'
-            WHEN cards_used > 3 THEN 'MULTIPLE_CARDS'
-            ELSE 'NORMAL'
-        END as risk_category
-    FROM transaction_behaviors
-),
-
-customer_value_segments AS (
-    SELECT 
-        tb.client_id,
-        tb.total_spending_idr,
-        tb.total_transactions,
-        tp.customer_tenure_days,
-        tp.active_days,
-        
-        CASE 
-            WHEN tb.total_spending_idr >= 1500000000 AND tp.customer_tenure_days >= 365 THEN 'VIP'
-            WHEN tb.total_spending_idr >= 750000000 THEN 'HIGH_VALUE'
-            WHEN tb.total_spending_idr >= 375000000 THEN 'MEDIUM_VALUE'
-            WHEN tb.total_spending_idr >= 150000000 THEN 'REGULAR'
-            ELSE 'LOW_VALUE'
-        END as value_segment,
-        
-        CASE 
-            WHEN tb.total_transactions >= 500 AND tp.active_days >= 100 THEN 'HIGHLY_ENGAGED'
-            WHEN tb.total_transactions >= 100 AND tp.active_days >= 30 THEN 'MODERATELY_ENGAGED'
-            WHEN tb.total_transactions >= 20 AND tp.active_days >= 10 THEN 'LIGHTLY_ENGAGED'
-            ELSE 'MINIMALLY_ENGAGED'
-        END as engagement_level,
-        
-        CASE 
-            WHEN tp.customer_tenure_days > 0 THEN 
-                ROUND(CAST(tb.total_transactions AS FLOAT64) / tp.customer_tenure_days, 4)
-            ELSE 0 
-        END as transactions_per_day,
-        
-        CASE 
-            WHEN tp.customer_tenure_days > 0 THEN 
-                ROUND(tb.total_spending_idr / tp.customer_tenure_days, 2)
-            ELSE 0 
-        END as spending_per_day_idr,
-        
-        CASE 
-            WHEN tp.active_days > 0 THEN 
-                ROUND(tb.total_spending_idr / tp.active_days, 2)
-            ELSE 0 
-        END as spending_per_active_day_idr
-    FROM transaction_behaviors tb
-    INNER JOIN temporal_patterns tp ON tb.client_id = tp.client_id
+WITH customer_profiles AS (
+  SELECT 
+    client_id,
+    MAX(yearly_income * 15000) as annual_income_idr,
+    MAX(credit_score) as credit_score,
+    MAX(credit_limit * 15000) as credit_limit_idr,
+    
+    CASE 
+      WHEN MAX(yearly_income * 15000) < 100000000 THEN 'LOW_INCOME'
+      WHEN MAX(yearly_income * 15000) < 300000000 THEN 'MIDDLE_INCOME'
+      WHEN MAX(yearly_income * 15000) < 500000000 THEN 'UPPER_MIDDLE'
+      ELSE 'HIGH_INCOME'
+    END as income_segment,
+    
+    CASE 
+      WHEN MAX(credit_score) >= 750 THEN 'EXCELLENT'
+      WHEN MAX(credit_score) >= 700 THEN 'GOOD' 
+      WHEN MAX(credit_score) >= 650 THEN 'FAIR'
+      ELSE 'POOR'
+    END as credit_tier
+    
+  FROM `mlops-thesis.mandiri.raw_data`
+  GROUP BY client_id
 )
 
 SELECT 
-    cd.client_id,
-    
-    cd.income_segment,
-    cd.credit_tier,
-    cd.credit_limit_tier,
-    cd.primary_card_brand,
-    cd.annual_income_idr,
-    cd.credit_score,
-    cd.credit_limit_idr,
-    
-    tb.total_transactions,
-    tb.total_spending_idr,
-    tb.avg_transaction_amount_idr,
-    tb.min_transaction_idr,
-    tb.max_transaction_idr,
-    tb.median_transaction_idr,
-    tb.p95_transaction_idr,
-    tb.spending_volatility_idr,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.credit_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as credit_usage_percent,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.debit_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as debit_usage_percent,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.chip_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as chip_adoption_percent,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.night_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as night_activity_percent,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.weekend_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as weekend_activity_percent,
-    
-    CASE 
-        WHEN tb.total_transactions > 0 THEN 
-            ROUND(CAST(tb.business_hours_transactions AS FLOAT64) / tb.total_transactions * 100, 1)
-        ELSE 0 
-    END as business_hours_percent,
-    
-    tb.unique_cities_visited,
-    tb.unique_states_visited,
-    tb.unique_merchants_used,
-    tb.unique_merchant_categories,
-    tb.cards_used,
-    
-    mca.grocery_spending_idr,
-    mca.restaurant_spending_idr,
-    mca.gas_spending_idr,
-    mca.transportation_spending_idr,
-    mca.travel_spending_idr,
-    mca.automotive_spending_idr,
-    mca.clothing_spending_idr,
-    mca.most_frequent_mcc,
-    mca.category_diversity,
-    
-    CASE 
-        WHEN tb.total_spending_idr > 0 THEN 
-            ROUND(mca.grocery_spending_idr / tb.total_spending_idr * 100, 1)
-        ELSE 0 
-    END as grocery_spending_percent,
-    
-    CASE 
-        WHEN tb.total_spending_idr > 0 THEN 
-            ROUND(mca.restaurant_spending_idr / tb.total_spending_idr * 100, 1)
-        ELSE 0 
-    END as restaurant_spending_percent,
-    
-    tp.active_days,
-    tp.active_weeks,
-    tp.active_months,
-    tp.active_years,
-    tp.customer_tenure_days,
-    tp.first_transaction_date,
-    tp.last_transaction_date,
-    tp.peak_spending_month,
-    tp.preferred_transaction_day,
-    tp.preferred_transaction_hour,
-    
-    cvs.value_segment,
-    cvs.engagement_level,
-    cvs.transactions_per_day,
-    cvs.spending_per_day_idr,
-    cvs.spending_per_active_day_idr,
-    
-    ra.error_rate_percent,
-    ra.risk_category,
-    ra.transaction_size_volatility_ratio,
-    ra.spending_consistency_score,
-    ra.night_activity_percent as risk_night_activity_percent,
-    
-    CASE 
-        WHEN tp.customer_tenure_days > 0 THEN 
-            ROUND(tb.total_spending_idr / tp.customer_tenure_days * 365, 0)
-        ELSE 0 
-    END as estimated_annual_value_idr,
-    
-    CASE 
-        WHEN tp.customer_tenure_days >= 1095 AND cvs.engagement_level IN ('HIGHLY_ENGAGED', 'MODERATELY_ENGAGED') THEN 'LOYAL'
-        WHEN tp.customer_tenure_days >= 730 THEN 'ESTABLISHED'
-        WHEN tp.customer_tenure_days >= 365 THEN 'DEVELOPING'
-        WHEN tp.customer_tenure_days >= 90 THEN 'RECENT'
-        ELSE 'NEW'
-    END as loyalty_segment,
-    
-    CASE 
-        WHEN cvs.transactions_per_day >= 0.1 AND ra.error_rate_percent <= 5 THEN 'HIGH_PROFIT_POTENTIAL'
-        WHEN cvs.transactions_per_day >= 0.05 AND ra.error_rate_percent <= 15 THEN 'MEDIUM_PROFIT_POTENTIAL'
-        ELSE 'LOW_PROFIT_POTENTIAL'
-    END as profitability_segment,
-    
-    CASE 
-        WHEN cd.credit_tier = 'EXCELLENT' AND cvs.value_segment IN ('VIP', 'HIGH_VALUE') 
-             AND ra.risk_category = 'NORMAL' THEN 'PREMIUM'
-        WHEN cd.credit_tier IN ('EXCELLENT', 'GOOD') AND cvs.value_segment IN ('HIGH_VALUE', 'MEDIUM_VALUE') THEN 'PREFERRED'
-        WHEN cvs.value_segment = 'REGULAR' AND ra.risk_category = 'NORMAL' THEN 'STANDARD'
-        ELSE 'BASIC'
-    END as overall_customer_tier
+  income_segment,
+  credit_tier,
+  COUNT(*) as customer_count,
+  ROUND(AVG(annual_income_idr), 0) as avg_income_idr,
+  ROUND(AVG(credit_score), 1) as avg_credit_score,
+  ROUND(AVG(credit_limit_idr), 0) as avg_credit_limit_idr,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as customer_percentage
+FROM customer_profiles
+GROUP BY income_segment, credit_tier
+ORDER BY customer_count DESC;
 
-FROM customer_demographics cd
-INNER JOIN transaction_behaviors tb ON cd.client_id = tb.client_id
-INNER JOIN merchant_category_analysis mca ON cd.client_id = mca.client_id
-INNER JOIN temporal_patterns tp ON cd.client_id = tp.client_id
-INNER JOIN risk_assessment ra ON cd.client_id = ra.client_id
-INNER JOIN customer_value_segments cvs ON cd.client_id = cvs.client_id
-
-WHERE 
-    tb.total_transactions >= 1
-    AND tp.customer_tenure_days >= 1
+WITH transaction_summary AS (
+  SELECT 
+    client_id,
+    COUNT(*) as total_transactions,
+    SUM(absolute_amount * 15000) as total_spending_idr,
+    AVG(absolute_amount * 15000) as avg_transaction_amount_idr,
+    STDDEV(absolute_amount * 15000) as spending_volatility_idr,
     
-ORDER BY 
-    cvs.value_segment DESC,
-    tb.total_spending_idr DESC,
-    ra.risk_category,
-    cd.client_id;
+    COUNTIF(payment_type = 'Credit') as credit_transactions,
+    COUNTIF(payment_type = 'Debit') as debit_transactions,
+    COUNTIF(use_chip = 'Chip Transaction') as chip_transactions,
+    COUNTIF(use_chip = 'Swipe Transaction') as swipe_transactions,
+    
+    COUNTIF(EXTRACT(HOUR FROM transaction_ts) BETWEEN 22 AND 23 
+             OR EXTRACT(HOUR FROM transaction_ts) BETWEEN 0 AND 6) as night_transactions,
+    COUNTIF(EXTRACT(DAYOFWEEK FROM transaction_ts) IN (1, 7)) as weekend_transactions,
+    
+    COUNT(DISTINCT merchant_city) as unique_cities,
+    COUNT(DISTINCT merchant_id) as unique_merchants
+    
+  FROM `mlops-thesis.mandiri.raw_data`
+  GROUP BY client_id
+),
+
+spending_segments AS (
+  SELECT 
+    *,
+    CASE 
+      WHEN total_spending_idr >= 150000000 THEN 'HIGH_VALUE'
+      WHEN total_spending_idr >= 75000000 THEN 'MEDIUM_VALUE'
+      WHEN total_spending_idr >= 15000000 THEN 'REGULAR'
+      ELSE 'LOW_VALUE'
+    END as customer_segment
+  FROM transaction_summary
+)
+
+SELECT 
+  customer_segment,
+  COUNT(*) as customer_count,
+  ROUND(AVG(total_spending_idr), 0) as avg_spending_idr,
+  ROUND(AVG(total_transactions), 1) as avg_transactions,
+  ROUND(AVG(SAFE_DIVIDE(credit_transactions, total_transactions)) * 100, 1) as credit_usage_rate_pct,
+  ROUND(AVG(SAFE_DIVIDE(chip_transactions, total_transactions)) * 100, 1) as chip_adoption_rate_pct,
+  ROUND(AVG(SAFE_DIVIDE(night_transactions, total_transactions)) * 100, 1) as night_activity_rate_pct,
+  ROUND(AVG(SAFE_DIVIDE(weekend_transactions, total_transactions)) * 100, 1) as weekend_activity_rate_pct,
+  ROUND(AVG(unique_cities), 1) as avg_unique_cities,
+  ROUND(AVG(unique_merchants), 1) as avg_unique_merchants
+  
+FROM spending_segments
+GROUP BY customer_segment
+ORDER BY avg_spending_idr DESC;
+
+WITH mcc_analysis AS (
+  SELECT 
+    mcc,
+    CASE 
+      WHEN mcc = 5411 THEN 'Grocery Stores'
+      WHEN mcc IN (5812, 5813, 5814) THEN 'Restaurants'
+      WHEN mcc = 5541 THEN 'Gas Stations'
+      WHEN mcc = 4121 THEN 'Transportation'
+      WHEN mcc = 7011 THEN 'Hotels/Lodging'
+      WHEN mcc = 7538 THEN 'Auto Services'
+      WHEN mcc BETWEEN 4000 AND 4999 THEN 'Transportation & Travel'
+      WHEN mcc BETWEEN 5000 AND 5099 THEN 'Automotive'
+      WHEN mcc BETWEEN 5200 AND 5299 THEN 'Home & Garden'
+      WHEN mcc BETWEEN 5300 AND 5399 THEN 'Clothing & Accessories'
+      WHEN mcc BETWEEN 5900 AND 5999 THEN 'General Merchandise'
+      WHEN mcc BETWEEN 7200 AND 7299 THEN 'Personal Services'
+      WHEN mcc BETWEEN 8000 AND 8999 THEN 'Professional Services'
+      ELSE CONCAT('Other (MCC: ', CAST(mcc AS STRING), ')')
+    END as category,
+    
+    COUNT(*) as transaction_count,
+    SUM(absolute_amount * 15000) as total_amount_idr,
+    AVG(absolute_amount * 15000) as avg_amount_idr,
+    COUNT(DISTINCT client_id) as unique_customers
+    
+  FROM `mlops-thesis.mandiri.raw_data`
+  GROUP BY mcc
+),
+
+category_summary AS (
+  SELECT 
+    category,
+    SUM(transaction_count) as total_transactions,
+    SUM(total_amount_idr) as total_spending_idr,
+    AVG(avg_amount_idr) as avg_transaction_size_idr,
+    SUM(unique_customers) as total_customers
+  FROM mcc_analysis
+  GROUP BY category
+)
+
+SELECT 
+  category,
+  total_transactions,
+  ROUND(total_spending_idr, 0) as total_spending_idr,
+  ROUND(avg_transaction_size_idr, 0) as avg_transaction_size_idr,
+  total_customers,
+  ROUND(total_spending_idr / (SELECT SUM(total_spending_idr) FROM category_summary) * 100, 2) as spending_share_pct,
+  ROUND(total_transactions / (SELECT SUM(total_transactions) FROM category_summary) * 100, 2) as transaction_share_pct
+FROM category_summary
+ORDER BY total_spending_idr DESC;
+
+WITH risk_metrics AS (
+  SELECT 
+    client_id,
+    card_id,
+    COUNT(*) as total_transactions,
+    COUNTIF(errors_imputed != 'Errorless') as error_transactions,
+    COUNTIF(errors_imputed = 'Bad PIN') as bad_pin_attempts,
+    COUNTIF(errors_imputed = 'Insufficient Balance') as insufficient_balance,
+    COUNTIF(errors_imputed = 'Technical Glitch') as technical_errors,
+    COUNTIF(amount < 0) as refund_transactions,
+    MAX(absolute_amount * 15000) as max_transaction_idr,
+    AVG(absolute_amount * 15000) as avg_transaction_idr
+  FROM `mlops-thesis.mandiri.raw_data`
+  GROUP BY client_id, card_id
+),
+
+risk_categorized AS (
+  SELECT 
+    *,
+    CASE 
+      WHEN SAFE_DIVIDE(error_transactions, total_transactions) > 0.1 THEN 'HIGH_ERROR_RATE'
+      WHEN bad_pin_attempts >= 3 THEN 'SECURITY_CONCERN'  
+      WHEN SAFE_DIVIDE(max_transaction_idr, NULLIF(avg_transaction_idr, 0)) > 10 THEN 'UNUSUAL_LARGE_TXN'
+      ELSE 'NORMAL'
+    END as risk_category
+  FROM risk_metrics 
+  WHERE total_transactions >= 5
+)
+
+SELECT 
+  risk_category,
+  COUNT(*) as card_count,
+  ROUND(AVG(SAFE_DIVIDE(error_transactions, total_transactions)) * 100, 2) as avg_error_rate_pct,
+  ROUND(AVG(bad_pin_attempts), 1) as avg_bad_pins,
+  ROUND(AVG(insufficient_balance), 1) as avg_insufficient_balance,
+  ROUND(AVG(technical_errors), 1) as avg_technical_errors,
+  ROUND(AVG(refund_transactions), 1) as avg_refunds,
+  ROUND(AVG(max_transaction_idr), 0) as avg_max_transaction_idr,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as card_percentage
+  
+FROM risk_categorized
+GROUP BY risk_category
+ORDER BY card_count DESC;
+
+WITH monthly_data AS (
+  SELECT 
+    EXTRACT(YEAR FROM transaction_ts) as year,
+    EXTRACT(MONTH FROM transaction_ts) as month,
+    COUNT(*) as transaction_count,
+    SUM(absolute_amount * 15000) as total_amount_idr,
+    AVG(absolute_amount * 15000) as avg_amount_idr,
+    COUNT(DISTINCT client_id) as active_customers,
+    COUNT(DISTINCT card_id) as active_cards
+  FROM `mlops-thesis.mandiri.raw_data`
+  GROUP BY year, month
+),
+
+with_growth_metrics AS (
+  SELECT 
+    *,
+    LAG(transaction_count, 1) OVER (ORDER BY year, month) as prev_month_count,
+    LAG(total_amount_idr, 1) OVER (ORDER BY year, month) as prev_month_amount,
+    LAG(active_customers, 1) OVER (ORDER BY year, month) as prev_month_customers,
+    
+    ROUND(
+      (transaction_count - LAG(transaction_count, 1) OVER (ORDER BY year, month)) / 
+      NULLIF(LAG(transaction_count, 1) OVER (ORDER BY year, month), 0) * 100, 
+      2
+    ) as txn_mom_growth_pct,
+    
+    ROUND(
+      (total_amount_idr - LAG(total_amount_idr, 1) OVER (ORDER BY year, month)) / 
+      NULLIF(LAG(total_amount_idr, 1) OVER (ORDER BY year, month), 0) * 100, 
+      2
+    ) as amount_mom_growth_pct,
+    
+    ROUND(
+      (active_customers - LAG(active_customers, 1) OVER (ORDER BY year, month)) / 
+      NULLIF(LAG(active_customers, 1) OVER (ORDER BY year, month), 0) * 100, 
+      2
+    ) as customer_mom_growth_pct
+
+  FROM monthly_data
+)
+
+SELECT 
+  year,
+  month,
+  transaction_count,
+  ROUND(total_amount_idr, 0) as total_amount_idr,
+  ROUND(avg_amount_idr, 0) as avg_amount_idr,
+  active_customers,
+  active_cards,
+  txn_mom_growth_pct,
+  amount_mom_growth_pct,
+  customer_mom_growth_pct,
+  
+  CASE month
+    WHEN 1 THEN 'January'
+    WHEN 2 THEN 'February' 
+    WHEN 3 THEN 'March'
+    WHEN 4 THEN 'April'
+    WHEN 5 THEN 'May'
+    WHEN 6 THEN 'June'
+    WHEN 7 THEN 'July'
+    WHEN 8 THEN 'August'
+    WHEN 9 THEN 'September'
+    WHEN 10 THEN 'October'
+    WHEN 11 THEN 'November'
+    WHEN 12 THEN 'December'
+  END as month_name
+
+FROM with_growth_metrics
+ORDER BY year, month;
+
+WITH customer_360 AS (
+  SELECT 
+    rd.client_id,
+    
+    MAX(rd.yearly_income * 15000) as annual_income_idr,
+    MAX(rd.credit_score) as credit_score,
+    MAX(rd.credit_limit * 15000) as credit_limit_idr,
+    
+    COUNT(*) as total_transactions,
+    SUM(rd.absolute_amount * 15000) as total_spending_idr,
+    AVG(rd.absolute_amount * 15000) as avg_transaction_idr,
+    
+    AVG(CASE WHEN rd.payment_type = 'Credit' THEN 1.0 ELSE 0.0 END) as credit_preference,
+    AVG(CASE WHEN rd.use_chip = 'Chip Transaction' THEN 1.0 ELSE 0.0 END) as chip_preference,
+    
+    COUNT(DISTINCT rd.merchant_city) as cities_visited,
+    COUNT(DISTINCT rd.merchant_id) as merchants_used,
+    COUNT(DISTINCT rd.mcc) as category_diversity,
+    
+    AVG(CASE WHEN EXTRACT(HOUR FROM rd.transaction_ts) BETWEEN 9 AND 17 THEN 1.0 ELSE 0.0 END) as business_hours_activity,
+    AVG(CASE WHEN EXTRACT(DAYOFWEEK FROM rd.transaction_ts) IN (2,3,4,5,6) THEN 1.0 ELSE 0.0 END) as weekday_activity,
+    
+    AVG(CASE WHEN rd.errors_imputed != 'Errorless' THEN 1.0 ELSE 0.0 END) as error_rate
+    
+  FROM `mlops-thesis.mandiri.raw_data` rd
+  GROUP BY rd.client_id
+  HAVING COUNT(*) >= 10
+),
+
+customer_segments AS (
+  SELECT 
+    *,
+    CASE 
+      WHEN annual_income_idr >= 500000000 AND total_spending_idr >= 150000000 THEN 'PREMIUM'
+      WHEN annual_income_idr >= 300000000 AND total_spending_idr >= 75000000 THEN 'AFFLUENT'
+      WHEN annual_income_idr >= 100000000 AND total_spending_idr >= 30000000 THEN 'MASS_MARKET'
+      ELSE 'BASIC'
+    END as customer_tier
+    
+  FROM customer_360
+)
+
+SELECT 
+  customer_tier,
+  COUNT(*) as customer_count,
+  
+  ROUND(AVG(annual_income_idr), 0) as avg_annual_income_idr,
+  ROUND(AVG(credit_score), 0) as avg_credit_score,
+  ROUND(AVG(credit_limit_idr), 0) as avg_credit_limit_idr,
+  
+  ROUND(AVG(total_spending_idr), 0) as avg_total_spending_idr,
+  ROUND(AVG(avg_transaction_idr), 0) as avg_transaction_size_idr,
+  ROUND(AVG(total_transactions), 0) as avg_transactions,
+  
+  ROUND(AVG(cities_visited), 1) as avg_cities_visited,
+  ROUND(AVG(merchants_used), 0) as avg_merchants_used,
+  ROUND(AVG(category_diversity), 0) as avg_categories,
+  
+  ROUND(AVG(credit_preference) * 100, 1) as credit_usage_pct,
+  ROUND(AVG(chip_preference) * 100, 1) as chip_adoption_pct,
+  ROUND(AVG(business_hours_activity) * 100, 1) as business_hours_pct,
+  ROUND(AVG(weekday_activity) * 100, 1) as weekday_activity_pct,
+  ROUND(AVG(error_rate) * 100, 2) as avg_error_rate_pct
+
+FROM customer_segments
+GROUP BY customer_tier
+ORDER BY avg_total_spending_idr DESC;
