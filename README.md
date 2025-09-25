@@ -144,7 +144,7 @@ CREATE OR REPLACE TABLE `mlops-thesis.mandiri.raw_data` AS (
 Date: 25 September 2025
 
 ### 📧 Contact
-For questions about this analysis or technical implementation, please contact me.
+For questions about this analysis or technical implementation, please contact the author.
 
 ---
 *This analysis provides strategic insights for Mandiri Sekuritas customer portfolio optimization based on comprehensive behavioral data analysis.*
